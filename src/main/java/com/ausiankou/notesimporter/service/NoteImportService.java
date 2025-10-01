@@ -8,18 +8,17 @@ import com.ausiankou.notesimporter.entity.PatientProfile;
 import com.ausiankou.notesimporter.repository.CompanyUserRepository;
 import com.ausiankou.notesimporter.repository.PatientNoteRepository;
 import com.ausiankou.notesimporter.repository.PatientProfileRepository;
-import jakarta.transaction.Transactional;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
+import java.util.*;
+import java.util.stream.Collectors;
 
 @Service
 @RequiredArgsConstructor
@@ -30,8 +29,7 @@ public class NoteImportService {
     private final CompanyUserRepository companyUserRepository;
     private final PatientNoteRepository patientNoteRepository;
 
-
-    @Transactional
+    // УБРАНА аннотация @Transactional с основного метода
     public void importNotes() {
         log.info("<-------------!------------->");
         log.info("Starting notes import process");
@@ -45,9 +43,15 @@ public class NoteImportService {
 
         ImportStats stats = new ImportStats();
 
+        // Оптимизация: получаем всех пациентов за ОДИН запрос к БД
+        Map<String, PatientProfile> patientsByGuid = getPatientsByGuid(oldClients);
+
+        // Кэш пользователей для уменьшения запросов к БД
+        Map<String, CompanyUser> userCache = new HashMap<>();
+
         for (OldClientDto oldClient : oldClients) {
             try {
-                processClient(oldClient, stats);
+                processClient(oldClient, patientsByGuid, userCache, stats);
             } catch (Exception e) {
                 log.error("Error processing client with guid {}: {}", oldClient.getGuid(), e.getMessage());
                 stats.incrementErrors();
@@ -58,17 +62,42 @@ public class NoteImportService {
                 stats.getImported(), stats.getUpdated(), stats.getSkipped(), stats.getErrors());
     }
 
-    private void processClient(OldClientDto oldClient, ImportStats stats) {
+    private Map<String, PatientProfile> getPatientsByGuid(List<OldClientDto> oldClients) {
+        List<String> clientGuids = oldClients.stream()
+                .map(OldClientDto::getGuid)
+                .collect(Collectors.toList());
+
+        log.debug("Fetching patients for {} guids", clientGuids.size());
+
+        // Получаем всех пациентов за ОДИН запрос
+        List<PatientProfile> patients = patientProfileRepository.findByOldClientGuidsIn(clientGuids);
+
+        Map<String, PatientProfile> result = new HashMap<>();
+        for (PatientProfile patient : patients) {
+            if (patient.getOldClientGuids() != null) {
+                // Обрабатываем случай, когда в oldClientGuid несколько GUID через запятую
+                String[] guids = patient.getOldClientGuids().split(",");
+                for (String guid : guids) {
+                    result.put(guid.trim(), patient);
+                }
+            }
+        }
+
+        log.debug("Found {} patients for {} guids", result.size(), clientGuids.size());
+        return result;
+    }
+
+    private void processClient(OldClientDto oldClient, Map<String, PatientProfile> patientsByGuid,
+                               Map<String, CompanyUser> userCache, ImportStats stats) {
         log.debug("Processing client: {}", oldClient.getGuid());
 
-        Optional<PatientProfile> patientOpt = patientProfileRepository.findByOldClientGuid(oldClient.getGuid());
-        if (patientOpt.isEmpty()) {
+        PatientProfile patient = patientsByGuid.get(oldClient.getGuid());
+        if (patient == null) {
             log.warn("No patient found for old client guid: {}", oldClient.getGuid());
             stats.incrementSkipped();
             return;
         }
 
-        PatientProfile patient = patientOpt.get();
         log.debug("Found patient: id={}, status={}", patient.getId(), patient.getStatusId());
 
         if (!isPatientActive(patient)) {
@@ -88,9 +117,11 @@ public class NoteImportService {
         }
 
         log.info("Processing {} notes for patient {}", oldNotes.size(), patient.getId());
+
+        // Обрабатываем каждую заметку с отдельной транзакцией
         for (OldNoteDto oldNote : oldNotes) {
             try {
-                processNote(oldNote, patient, stats);
+                processNoteInTransaction(oldNote, patient, userCache, stats);
             } catch (Exception e) {
                 log.error("Error processing note {}: {}", oldNote.getGuid(), e.getMessage());
                 stats.incrementErrors();
@@ -98,33 +129,16 @@ public class NoteImportService {
         }
     }
 
-    private boolean isPatientActive(PatientProfile patient) {
-        final List<Integer> ACTIVE_STATUSES = List.of(200, 210, 230);
-        // Явно преобразуем Short в int
-        int statusId = patient.getStatusId().intValue();
-        boolean isActive = ACTIVE_STATUSES.contains(statusId);
-
-        log.debug("Patient status check: id={}, status={}, isActive={}",
-                patient.getId(), statusId, isActive);
-
-        if (statusId == 200 && !isActive) {
-            log.error("INCONSISTENCY: Status 200 should be active but was not recognized!");
-        }
-
-        if (statusId == 210 && !isActive) {
-            log.error("INCONSISTENCY: Status 210 should be active but was not recognized!");
-        }
-
-        if (statusId == 230 && !isActive) {
-            log.error("INCONSISTENCY: Status 230 should be active but was not recognized!");
-        }
-
-        return isActive;
+    // Отдельная транзакция для каждой заметки
+    @Transactional
+    protected void processNoteInTransaction(OldNoteDto oldNote, PatientProfile patient,
+                                            Map<String, CompanyUser> userCache, ImportStats stats) {
+        processNote(oldNote, patient, userCache, stats);
     }
 
-
-    private void processNote(OldNoteDto oldNote, PatientProfile patient, ImportStats stats) {
-        CompanyUser user = getOrCreateUser(oldNote.getLoggedUser());
+    private void processNote(OldNoteDto oldNote, PatientProfile patient,
+                             Map<String, CompanyUser> userCache, ImportStats stats) {
+        CompanyUser user = getOrCreateUser(oldNote.getLoggedUser(), userCache);
         Optional<PatientNote> existingNoteOpt = patientNoteRepository.findByOldNoteGuid(oldNote.getGuid());
 
         if (existingNoteOpt.isPresent()) {
@@ -147,7 +161,7 @@ public class NoteImportService {
             log.info("Updated note: {}", oldNote.getGuid());
         } else if (existingNoteModified.isAfter(oldNoteModified)) {
             stats.incrementSkipped();
-            log.info("Skipped note (newer version exists): {}", oldNote.getGuid());
+            log.debug("Skipped note (newer version exists): {}", oldNote.getGuid());
         } else {
             stats.incrementSkipped();
             log.debug("Skipped note (no changes): {}", oldNote.getGuid());
@@ -169,19 +183,39 @@ public class NoteImportService {
         log.info("Created new note: {}", oldNote.getGuid());
     }
 
-    private CompanyUser getOrCreateUser(String login) {
-        return companyUserRepository.findByLogin(login)
+    private CompanyUser getOrCreateUser(String login, Map<String, CompanyUser> userCache) {
+        // Пробуем получить из кэша
+        CompanyUser cachedUser = userCache.get(login);
+        if (cachedUser != null) {
+            return cachedUser;
+        }
+
+        // Ищем в БД или создаем нового
+        CompanyUser user = companyUserRepository.findByLogin(login)
                 .orElseGet(() -> {
                     log.info("Creating new user: {}", login);
                     CompanyUser newUser = new CompanyUser();
                     newUser.setLogin(login);
                     return companyUserRepository.save(newUser);
                 });
+
+        // Сохраняем в кэш
+        userCache.put(login, user);
+        return user;
+    }
+
+    private boolean isPatientActive(PatientProfile patient) {
+        int statusId = patient.getStatusId().intValue();
+        boolean isActive = statusId == 200 || statusId == 210 || statusId == 230;
+
+        log.debug("Patient status check: id={}, status={}, isActive={}",
+                patient.getId(), statusId, isActive);
+
+        return isActive;
     }
 
     private LocalDateTime parseDateTime(String dateTimeStr) {
         try {
-            // Пробуем оба формата
             try {
                 return LocalDateTime.parse(dateTimeStr, DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
             } catch (DateTimeParseException e) {
@@ -194,7 +228,7 @@ public class NoteImportService {
     }
 
     @Data
-    private static class ImportStats {
+    public static class ImportStats {
         private int imported;
         private int updated;
         private int skipped;

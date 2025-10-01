@@ -5,7 +5,7 @@ import com.ausiankou.notesimporter.dto.OldNoteDto;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.http.*;
+import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.HttpClientErrorException;
 import org.springframework.web.client.RestTemplate;
@@ -25,9 +25,11 @@ public class OldSystemClient {
         try {
             String url = oldSystemBaseUrl + "/clients";
             OldClientDto[] clients = restTemplate.postForObject(url, null, OldClientDto[].class);
-            return clients != null ? Arrays.asList(clients) : Collections.emptyList();
+            List<OldClientDto> result = clients != null ? Arrays.asList(clients) : Collections.emptyList();
+            log.info("Successfully fetched {} clients from old system", result.size());
+            return result;
         } catch (Exception e) {
-            log.error("Error fetching clients from old system", e);
+            log.error("Error fetching clients from old system: {}", e.getMessage());
             return Collections.emptyList();
         }
     }
@@ -41,10 +43,19 @@ public class OldSystemClient {
                     "dateFrom", "2000-01-01",
                     "dateTo", "2030-12-31"
             );
+
+            log.debug("Requesting notes for agency: {}, clientGuid: {}", agency, clientGuid);
             OldNoteDto[] notes = restTemplate.postForObject(url, request, OldNoteDto[].class);
-            return notes != null ? Arrays.asList(notes) : Collections.emptyList();
+            List<OldNoteDto> result = notes != null ? Arrays.asList(notes) : Collections.emptyList();
+            log.debug("Found {} notes for client {}", result.size(), clientGuid);
+            return result;
+
+        } catch (HttpClientErrorException.NotFound e) {
+            log.warn("No notes found for client {} (agency: {})", clientGuid, agency);
+            return Collections.emptyList();
         } catch (Exception e) {
-            log.error("Error fetching notes for client {}", clientGuid, e);
+            log.error("Error fetching notes for client {} (agency: {}): {}",
+                    clientGuid, agency, e.getMessage());
             return Collections.emptyList();
         }
     }
